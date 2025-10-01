@@ -5,10 +5,14 @@ import json
 import logging
 from typing import List, Tuple, Optional, Set
 from enum import IntEnum
+import aiohttp 
+from typing import Dict, Any
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+WORLD_SERVER_URL = "http://localhost:8000/battle_results"  # عنوان سيرفر العالم
 
 # ===== Constants =====
 class UnitState(IntEnum):
@@ -407,6 +411,9 @@ class World:
         
         self.soldier_count = 0
         self.next_unit_id = 0
+        self.battle_id: Optional[str] = None
+        self.player_units_map: Dict[int, str] = {}  # {unit_id: player_id}
+        self.unit_type_map: Dict[int, str] = {}  # {unit_id: unit_type_id}
         
         self.obstacles = [
             (200, 150, 100, 50),
@@ -433,10 +440,18 @@ class World:
         
         return np.all(in_zone)
     
-    def spawn_unit(self, team_id: int, num_soldiers: int, start_position: Tuple[float, float]) -> int:
+    def spawn_unit(self, team_id: int, num_soldiers: int, start_position: Tuple[float, float], unit_type_id: str, unit_template: dict, player_id: Optional[str] = None) -> int:
+        """
+        إنشاء وحدة جديدة باستخدام خصائص من القالب المخزن
+        
+        Args:
+            unit_template: قاموس يحتوي على {health, attack_damage, attack_range, dodge_chance}
+        """
         unit_id = self.next_unit_id
         self.next_unit_id += 1
-        
+        self.unit_type_map[unit_id] = unit_type_id
+        if player_id:
+            self.player_units_map[unit_id] = player_id
         # إنشاء تشكيل شبكي
         cols = int(np.sqrt(num_soldiers))
         rows = (num_soldiers + cols - 1) // cols
@@ -459,13 +474,13 @@ class World:
         new_teams = np.full(num_soldiers, team_id, dtype=np.int32)
         new_unit_ids = np.full(num_soldiers, unit_id, dtype=np.int32)
         new_targets = new_positions.copy()
-        new_healths = np.full(num_soldiers, DEFAULT_HEALTH, dtype=np.float32)
-        new_attack_ranges = np.full(num_soldiers, DEFAULT_ATTACK_RANGE, dtype=np.float32)
-        new_attack_damages = np.full(num_soldiers, DEFAULT_ATTACK_DAMAGE, dtype=np.float32)
+        new_healths = np.full(num_soldiers, unit_template.get('health', DEFAULT_HEALTH), dtype=np.float32)
+        new_attack_ranges = np.full(num_soldiers, unit_template.get('attack_range', DEFAULT_ATTACK_RANGE), dtype=np.float32)
+        new_attack_damages = np.full(num_soldiers, unit_template.get('attack_damage', DEFAULT_ATTACK_DAMAGE), dtype=np.float32)
+        new_dodge_chances = np.full(num_soldiers, unit_template.get('dodge_chance', DEFAULT_DODGE_CHANCE), dtype=np.float32)
         new_attack_cooldowns = np.zeros(num_soldiers, dtype=np.float32)
         new_states = np.full(num_soldiers, UnitState.IDLE, dtype=np.int32)
         new_timers = np.zeros(num_soldiers, dtype=np.float32)
-        new_dodge_chances = np.full(num_soldiers, DEFAULT_DODGE_CHANCE, dtype=np.float32)
         new_evade_counts = np.zeros(num_soldiers, dtype=np.int32)
         new_prev_states = new_states.copy()
         
@@ -598,7 +613,6 @@ class World:
 
         self.state_timers[mask] = 0.0
 
-    
     def select_units(self, unit_ids: List[int]):
         for uid in unit_ids:
             mask = self.unit_ids == uid
@@ -666,7 +680,6 @@ class World:
             self.states[moving_mask] = UnitState.MOVING
             self.state_timers[moving_mask] = 0.0
 
-    
     def apply_separation_force(self, movements: np.ndarray) -> np.ndarray:
         if self.soldier_count == 0:
             return movements
@@ -802,7 +815,37 @@ class World:
 
         # إذا كلا الجانبين لهما ناجين -> المعركة مستمرة
         return None
-    
+
+    def reset_for_new_battle(self):
+        """إعادة تعيين حالة العالم لمعركة جديدة مع الحفاظ على الإعدادات الأساسية"""
+        self.selected_units.clear()
+        self.units_reformed.clear()
+        self.units_need_reform.clear()
+        self.battle_started = False
+        self.battle_id = None
+        self.player_units_map.clear()
+        self.unit_type_map.clear()
+        
+        # إعادة تعيين المصفوفات
+        self.positions = np.empty((0, 2), dtype=np.float32)
+        self.teams = np.empty(0, dtype=np.int32)
+        self.unit_ids = np.empty(0, dtype=np.int32)
+        self.target_positions = np.empty((0, 2), dtype=np.float32)
+        self.healths = np.empty(0, dtype=np.float32)
+        self.attack_ranges = np.empty(0, dtype=np.float32)
+        self.attack_damages = np.empty(0, dtype=np.float32)
+        self.attack_cooldowns = np.empty(0, dtype=np.float32)
+        self.states = np.empty(0, dtype=np.int32)
+        self.dodge_chances = np.empty(0, dtype=np.float32)
+        self.evade_counts = np.empty(0, dtype=np.int32)
+        self.state_timers = np.empty(0, dtype=np.float32)
+        self.prev_states = np.empty(0, dtype=np.int32)
+        self.quadtree = None
+        self.soldier_count = 0
+        self.next_unit_id = 0
+        
+        logger.info("World reset for new battle")
+
     def _clamp_point_to_zone(self, team_id: int, point: Tuple[float, float]) -> Tuple[float, float]:
         """
         قفل نقطة داخل منطقة نشر الفريق (أو داخل حدود الخريطة إذا المعركة بدأت أو المنطقة غير موجودة).
@@ -825,7 +868,8 @@ class World:
         report = {
             "winner": None,
             "teams": {},
-            "alliances": {}
+            "alliances": {},
+            "surviving_units": []
         }
 
         # قناع الجنود الأحياء
@@ -887,6 +931,24 @@ class World:
         report["alliances"]["allies"] = alliance_stats(allies_mask)
         report["alliances"]["enemies"] = alliance_stats(enemies_mask)
 
+        
+        
+        alive_mask = self.healths > 0
+        for uid in np.unique(self.unit_ids[alive_mask]):
+            mask_unit = (self.unit_ids == uid) & alive_mask
+            num_soldiers = int(np.sum(mask_unit))
+            if num_soldiers > 0:
+                avg_health = float(np.mean(self.healths[mask_unit]))
+                report["surviving_units"].append({
+                    "unit_id": int(uid),
+                    "owner_player_id": self.player_units_map.get(uid),
+                    "unit_type_id": self.unit_type_map.get(uid),
+                    "soldiers_remaining": num_soldiers,
+                    "average_health": round(avg_health, 2)
+                })
+        
+        report["battle_id"] = self.battle_id
+        
         return report
 
     def update(self, delta_time: float):
@@ -1014,7 +1076,9 @@ class CommandValidator:
         'form': ['unit_id', 'start', 'end'],
         'select': ['unit_ids'],
         'move_selected': ['target'],
-        'spawn': ['team_id', 'num_soldiers', 'position']
+        'spawn': ['team_id', 'num_soldiers', 'position'],
+        'register_unit_types': ['data'],
+        'setup_battle': ['battle_id', 'players']
     }
     
     @staticmethod
@@ -1047,11 +1111,13 @@ class GameServer:
         # Command queue: process commands exactly once per tick at the top of the game loop
         self.command_queue: asyncio.Queue = asyncio.Queue()
         
-        # spawn initial units (same as original)
-        self.world.spawn_unit(team_id=Team.PLAYER, num_soldiers=200, start_position=(150, 150))
-        # self.world.spawn_unit(team_id=Team.ALLY, num_soldiers=96, start_position=(500, 200))
-        self.world.spawn_unit(team_id=Team.ENEMY, num_soldiers=200, start_position=(300, 100))
-        #self.world.spawn_unit(team_id=Team.ENEMY, num_soldiers=500, start_position=(300, 100))
+        self.unit_templates: Dict[str, Dict[str, Any]] = {}
+        
+        # حالة السيرفر
+        self.battle_active = False
+        self.battle_setup_complete = False
+        
+        logger.info("Battle Server initialized - Ready for unit type registration")
     
     async def handle_client(self, websocket):
         self.clients.add(websocket)
@@ -1071,7 +1137,24 @@ class GameServer:
         finally:
             self.clients.remove(websocket)
             logger.info(f"Client disconnected. Total clients: {len(self.clients)}")
-    
+
+    async def send_results_to_world_server(self, report: dict):
+        """إرسال نتائج المعركة إلى سيرفر العالم"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(WORLD_SERVER_URL, json=report) as response:
+                    if response.status == 200:
+                        logger.info(f"Battle results sent successfully for battle_id: {report.get('battle_id')}")
+                    else:
+                        logger.error(f"Failed to send results: {response.status}")
+        except Exception as e:
+            logger.error(f"Error sending results to world server: {e}")
+
+    def validate_unit_template(self, template: dict) -> bool:
+        """التحقق من صحة قالب الوحدة"""
+        required_keys = ['health', 'attack_damage', 'attack_range', 'dodge_chance']
+        return all(key in template for key in required_keys)
+
     async def process_command(self, cmd: dict):
         valid, error = self.validator.validate(cmd)
         if not valid:
@@ -1080,6 +1163,54 @@ class GameServer:
         
         cmd_type = cmd['type']
         
+        # الأوامر الجديدة
+        if cmd_type == 'register_unit_types':
+            data = cmd['data']
+            for unit_type_id, template in data.items():
+                if self.validate_unit_template(template):
+                    self.unit_templates[unit_type_id] = template
+                    logger.info(f"Registered unit type: {unit_type_id}")
+                else:
+                    logger.warning(f"Invalid template for unit type: {unit_type_id}")
+            return
+        
+        elif cmd_type == 'setup_battle':
+            if self.battle_active:
+                logger.warning("Cannot setup battle while another is active")
+                return
+            
+            battle_id = cmd['battle_id']
+            players = cmd['players']
+            
+            self.world.battle_id = battle_id
+            self.battle_setup_complete = False
+            
+            for player in players:
+                player_id = player['player_id']
+                team_id = player['team_id']
+                
+                for unit_data in player['units']:
+                    unit_type_id = unit_data['unit_type_id']
+                    
+                    if unit_type_id not in self.unit_templates:
+                        logger.error(f"Unknown unit type: {unit_type_id}")
+                        continue
+                    
+                    template = self.unit_templates[unit_type_id]
+                    self.world.spawn_unit(
+                        team_id=team_id,
+                        num_soldiers=unit_data['num_soldiers'],
+                        start_position=tuple(unit_data['initial_position']),
+                        unit_type_id=unit_type_id,
+                        unit_template=template,
+                        player_id=player_id
+                    )
+            
+            self.battle_setup_complete = True
+            logger.info(f"Battle {battle_id} setup complete - Waiting for start command")
+            return
+        
+        # الأوامر الموجودة
         if cmd_type == 'move':
             self.world.move_unit(cmd['unit_id'], tuple(cmd['target']))
         
@@ -1096,10 +1227,28 @@ class GameServer:
             self.world.move_selected_units(tuple(cmd['target']))
         
         elif cmd_type == 'spawn':
-            self.world.spawn_unit(cmd['team_id'], cmd['num_soldiers'], tuple(cmd['position']))
+            # للتوافق مع الأوامر القديمة (للاختبار فقط)
+            unit_type_id = cmd.get('unit_type_id', 'default')
+            template = self.unit_templates.get(unit_type_id, {
+                'health': DEFAULT_HEALTH,
+                'attack_damage': DEFAULT_ATTACK_DAMAGE,
+                'attack_range': DEFAULT_ATTACK_RANGE,
+                'dodge_chance': DEFAULT_DODGE_CHANCE
+            })
+            self.world.spawn_unit(
+                cmd['team_id'], 
+                cmd['num_soldiers'], 
+                tuple(cmd['position']),
+                unit_type_id=unit_type_id,
+                unit_template=template
+            )
         
         elif cmd_type == 'start_battle':
+            if not self.battle_setup_complete:
+                logger.warning("Cannot start battle - setup not complete")
+                return
             self.world.start_battle()
+            self.battle_active = True
     
     async def broadcast_state(self, extra: dict = None):
         if self.clients:
@@ -1118,7 +1267,7 @@ class GameServer:
         delta_time = 1.0 / target_fps
         
         while True:
-            # Drain and process commands at the top of each tick (non-blocking)
+            # معالجة الأوامر
             while True:
                 try:
                     cmd = self.command_queue.get_nowait()
@@ -1126,19 +1275,31 @@ class GameServer:
                     break
                 else:
                     await self.process_command(cmd)
-
-            # Update world (which rebuilds the Quadtree once per frame)
-            self.world.update(delta_time)
-
-            if self.world.battle_started:
+            
+            # تحديث العالم فقط إذا كانت المعركة نشطة
+            if self.battle_active:
+                self.world.update(delta_time)
+                
                 winner = self.world.check_battle_end()
                 if winner is not None:
                     report = self.world.generate_battle_report()
-                    # إرسال التقرير لكل الكلاينت
+                    
+                    # إرسال النتائج للعملاء
                     await self.broadcast_state(extra=report)
+                    
+                    # إرسال النتائج لسيرفر العالم
+                    await self.send_results_to_world_server(report)
+                    
                     logger.info("Battle Report:\n" + json.dumps(report, indent=4, ensure_ascii=False))
-                    break
-
+                    
+                    # إعادة التعيين للمعركة التالية
+                    self.world.reset_for_new_battle()
+                    self.battle_active = False
+                    self.battle_setup_complete = False
+                    
+                    logger.info("Server ready for new battle")
+            
+            # بث الحالة دائماً
             await self.broadcast_state()
             await asyncio.sleep(delta_time)
     
